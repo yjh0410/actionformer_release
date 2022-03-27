@@ -11,6 +11,67 @@ from .losses import ctr_giou_loss_1d, sigmoid_focal_loss
 from ..utils import batched_nms
 
 
+@torch.no_grad()
+def get_ious_and_iou_loss(inputs,
+                          targets,
+                          weight=None,
+                          loss_type="iou",
+                          reduction="none"):
+    """
+    Compute iou loss of type ['iou', 'giou', 'linear_iou']
+
+    Args:
+        inputs (tensor): pred values
+        targets (tensor): target values
+        weight (tensor): loss weight
+        box_mode (str): 'xx' or 'lr', 'lr' is currently supported.
+        loss_type (str): 'giou' or 'iou' or 'linear_iou'
+        reduction (str): reduction manner
+
+    Returns:
+        loss (tensor): computed iou loss.
+    """
+    # box_mode = "lr"
+    inputs = torch.cat((-inputs[..., :1], inputs[..., 1:]), dim=-1)
+    targets = torch.cat((-targets[..., :1], targets[..., 1:]), dim=-1)
+
+    eps = torch.finfo(torch.float32).eps
+
+    inputs_area = (inputs[..., 1] - inputs[..., 0]).clamp_(min=0)
+    targets_area = (targets[..., 1] - targets[..., 0]).clamp_(min=0)
+
+    w_intersect = (torch.min(inputs[..., 1], targets[..., 1])
+                   - torch.max(inputs[..., 0], targets[..., 0])).clamp_(min=0)
+
+    area_intersect = w_intersect
+    area_union = targets_area + inputs_area - area_intersect
+    ious = area_intersect / area_union.clamp(min=eps)
+
+    if loss_type == "iou":
+        loss = -ious.clamp(min=eps).log()
+    elif loss_type == "linear_iou":
+        loss = 1 - ious
+    elif loss_type == "giou":
+        g_w_intersect = torch.max(inputs[..., 1], targets[..., 1]) \
+            - torch.min(inputs[..., 0], targets[..., 0])
+        ac_uion = g_w_intersect
+        gious = ious - (ac_uion - area_union) / ac_uion.clamp(min=eps)
+        loss = 1 - gious
+    else:
+        raise NotImplementedError
+    if weight is not None:
+        loss = loss * weight.view(loss.size())
+        if reduction == "mean":
+            loss = loss.sum() / max(weight.sum().item(), eps)
+    else:
+        if reduction == "mean":
+            loss = loss.mean()
+    if reduction == "sum":
+        loss = loss.sum()
+
+    return ious, loss
+
+
 class PtTransformerClsHead(nn.Module):
     """
     1D Conv heads for classification
@@ -228,6 +289,7 @@ class PtTransformer(nn.Module):
         self.train_dropout = train_cfg['dropout']
         self.train_droppath = train_cfg['droppath']
         self.train_label_smoothing = train_cfg['label_smoothing']
+        self.sinkhorn = SinkhornDistance(eps=0.1, max_iter=50)
 
         # test time config
         self.test_pre_nms_thresh = test_cfg['pre_nms_thresh']
@@ -363,8 +425,11 @@ class PtTransformer(nn.Module):
 
             # compute the gt labels for cls & reg
             # list of prediction targets
-            gt_cls_labels, gt_offsets = self.label_points(
-                points, gt_segments, gt_labels)
+            # gt_cls_labels, gt_offsets = self.label_points(
+            #     points, gt_segments, gt_labels)
+
+            gt_cls_labels, gt_offsets = self.dynamic_label_assignment(
+                points, out_cls_logits, out_offsets, gt_segments, gt_labels)
 
             # compute the loss and return
             losses = self.losses(
@@ -381,6 +446,129 @@ class PtTransformer(nn.Module):
                 out_cls_logits, out_offsets
             )
             return results
+
+    @torch.no_grad()
+    def dynamic_label_assignment(self, points, pred_cls_logits, pred_offsets, gt_segments, gt_labels):
+        gt_cls_labels = []
+        gt_offsets = []
+        assigned_units = []
+            
+        # [M, 1], share among all images, M = T1 + T2 + ...
+        points_over_all = torch.cat(points, dim=0)[..., :1]
+        strides_over_all = torch.cat(points, dim=0)[..., -1:]
+        # [B, M, C]
+        pred_cls_logits = torch.cat(pred_cls_logits, dim=1)
+        pred_offsets = torch.cat(pred_offsets, dim=1)
+
+        for tgt_segments_per_video, tgt_labels_per_video, pred_offsets_per_image, pred_cls_per_image in zip(
+                    gt_segments, gt_labels, pred_offsets, pred_cls_logits):
+            # [N, M, 2], N is the number of targets, M is the number of all anchors
+            deltas = self.get_deltas(points_over_all, tgt_segments_per_video.unsqueeze(1))
+            # Is in gt segments: [N, M]
+            is_in_segments = deltas.min(dim=-1).values > 0.01
+
+            center_sampling_radius = 2.5
+            # segment centers: [N, 1]
+            centers = (tgt_segments_per_video[:, :1] + tgt_segments_per_video[:, 1:]) * 0.5
+            is_in_centers = []
+            for stride, points_i in zip(self.fpn_strides, points):
+                radius = stride * center_sampling_radius
+                # [N, 2]
+                center_segments = torch.cat((
+                    torch.max(centers - radius, tgt_segments_per_video[:, :1]),
+                    torch.min(centers + radius, tgt_segments_per_video[:, 1:]),
+                ), dim=-1)
+                # [N, M, 2]
+                center_deltas = self.get_deltas(points_i[:, :1], center_segments.unsqueeze(1))
+                # In center segments: [N, M]
+                is_in_centers.append(center_deltas.min(dim=-1).values > 0)
+            # [N, M]. Here, M = M1 + M2, ...
+            is_in_centers = torch.cat(is_in_centers, dim=1)
+
+            del centers, center_segments, deltas, center_deltas
+            # [N, M], N is the number of targets, M is the number of all anchors
+            is_in_segments = (is_in_segments & is_in_centers)
+
+            num_gt = len(tgt_labels_per_video)  # N
+            num_anchor = len(points_over_all)   # M
+            shape = (num_gt, num_anchor, -1)    # [N, M, -1]
+
+            gt_cls_per_image = F.one_hot(tgt_labels_per_video, self.num_classes).float()
+
+            with torch.no_grad():
+                loss_cls = sigmoid_focal_loss(
+                    pred_cls_per_image.unsqueeze(0).expand(shape), # [M, C] -> [1, M, C] -> [N, M, C]
+                    gt_cls_per_image.unsqueeze(1).expand(shape),   # [N, C] -> [N, 1, C] -> [N, M, C]
+                ).sum(dim=-1) # [N, M, C] -> [N, M]
+
+                loss_cls_bg = sigmoid_focal_loss(
+                    pred_cls_per_image,
+                    torch.zeros_like(pred_cls_per_image),
+                ).sum(dim=-1) # [M, C] -> [M]
+
+                # [N, M, 2]
+                gt_offset_per_image = self.get_deltas(points_over_all, tgt_segments_per_video.unsqueeze(1))
+
+                pred_offsets_per_image = pred_offsets_per_image * strides_over_all
+                ious, loss_delta = get_ious_and_iou_loss(
+                    pred_offsets_per_image.unsqueeze(0).expand(shape), # [M, 2] -> [1, M, 2] -> [N, M, 2]
+                    gt_offset_per_image,
+                    loss_type='iou'
+                ) # [N, M]
+
+                loss = loss_cls + 6.0 * loss_delta + 1e6 * (1 - is_in_segments.float())
+
+                # Performing Dynamic k Estimation, top_candidates = 20
+                topk_ious, _ = torch.topk(ious * is_in_segments.float(), 20, dim=1)
+                mu = ious.new_ones(num_gt + 1)
+                mu[:-1] = torch.clamp(topk_ious.sum(1).int(), min=1).float()
+                mu[-1] = num_anchor - mu[:-1].sum()
+                nu = ious.new_ones(num_anchor)
+                loss = torch.cat([loss, loss_cls_bg.unsqueeze(0)], dim=0)
+
+                # Solving Optimal-Transportation-Plan pi via Sinkhorn-Iteration.
+                _, pi = self.sinkhorn(mu, nu, loss)
+
+                # Rescale pi so that the max pi for each gt equals to 1.
+                rescale_factor, _ = pi.max(dim=1)
+                pi = pi / rescale_factor.unsqueeze(1)
+
+                # matched_gt_inds: [M,]
+                max_assigned_units, matched_gt_inds = torch.max(pi, dim=0)
+                gt_cls_labels_i = tgt_labels_per_video.new_ones(num_anchor) * self.num_classes
+                # fg_mask: [M,]
+                fg_mask = matched_gt_inds != num_gt
+                gt_cls_labels_i[fg_mask] = tgt_labels_per_video[matched_gt_inds[fg_mask]]
+                gt_cls_labels.append(gt_cls_labels_i)
+                assigned_units.append(max_assigned_units)
+
+                gt_offsets_per_image = gt_offset_per_image.new_zeros((num_anchor, 2))
+                gt_offsets_per_image[fg_mask] = \
+                    gt_offset_per_image[matched_gt_inds[fg_mask], torch.arange(num_anchor)[fg_mask]]
+                # normalize target offsets
+                gt_offsets_per_image = gt_offsets_per_image / strides_over_all
+                gt_offsets.append(gt_offsets_per_image)
+
+        return gt_cls_labels, gt_offsets
+
+
+    def get_deltas(self, points, segments):
+        """
+        Get box regression transformation deltas (dl, dr) that can be used
+        to transform the `shifts` into the `boxes`. That is, the relation
+        ``boxes == self.apply_deltas(deltas, shifts)`` is true.
+
+        Args:
+            shifts (Tensor): shifts, e.g., feature map coordinates
+            segments (Tensor): target of the transformation, e.g., ground-truth segments.
+        """
+        assert isinstance(points, torch.Tensor), type(points)
+        assert isinstance(points, torch.Tensor), type(points)
+
+        deltas = torch.cat([points - segments[..., :1], 
+                            segments[..., 1:] - points],dim=-1)
+        return deltas
+
 
     @torch.no_grad()
     def preprocessing(self, video_list, padding_val=0.0):
@@ -740,3 +928,56 @@ class PtTransformer(nn.Module):
             )
 
         return processed_results
+
+
+class SinkhornDistance(torch.nn.Module):
+    r"""
+        Given two empirical measures each with :math:`P_1` locations
+        :math:`x\in\mathbb{R}^{D_1}` and :math:`P_2` locations :math:`y\in\mathbb{R}^{D_2}`,
+        outputs an approximation of the regularized OT cost for point clouds.
+        Args:
+        eps (float): regularization coefficient
+        max_iter (int): maximum number of Sinkhorn iterations
+        reduction (string, optional): Specifies the reduction to apply to the output:
+        'none' | 'mean' | 'sum'. 'none': no reduction will be applied,
+        'mean': the sum of the output will be divided by the number of
+        elements in the output, 'sum': the output will be summed. Default: 'none'
+        Shape:
+            - Input: :math:`(N, P_1, D_1)`, :math:`(N, P_2, D_2)`
+            - Output: :math:`(N)` or :math:`()`, depending on `reduction`
+    """
+
+    def __init__(self, eps=1e-3, max_iter=100, reduction='none'):
+        super(SinkhornDistance, self).__init__()
+        self.eps = eps
+        self.max_iter = max_iter
+        self.reduction = reduction
+
+    def forward(self, mu, nu, C):
+        u = torch.ones_like(mu)
+        v = torch.ones_like(nu)
+
+        # Sinkhorn iterations
+        for i in range(self.max_iter):
+            v = self.eps * \
+                (torch.log(
+                    nu + 1e-8) - torch.logsumexp(self.M(C, u, v).transpose(-2, -1), dim=-1)) + v
+            u = self.eps * \
+                (torch.log(
+                    mu + 1e-8) - torch.logsumexp(self.M(C, u, v), dim=-1)) + u
+
+        U, V = u, v
+        # Transport plan pi = diag(a)*K*diag(b)
+        pi = torch.exp(
+            self.M(C, U, V)).detach()
+        # Sinkhorn distance
+        cost = torch.sum(
+            pi * C, dim=(-2, -1))
+        return cost, pi
+
+    def M(self, C, u, v):
+        '''
+        "Modified cost for logarithmic updates"
+        "$M_{ij} = (-c_{ij} + u_i + v_j) / epsilon$"
+        '''
+        return (-C + u.unsqueeze(-1) + v.unsqueeze(-2)) / self.eps
